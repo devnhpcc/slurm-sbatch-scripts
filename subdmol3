@@ -1,0 +1,185 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for MaterialsStudio-DMol3"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n  <np>          Number of processors.
+	-N  <n1[:n2]>     Number of nodes and number of tasks per node. 
+	-m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version. Available: 2017, 2023 Default: 2023
+	-j  <jobname>     Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:   ${sname} ML -n 16 -m 2 -p amd128 -t 1-0"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLPART="##SBATCH --partition="
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+Ver="2023"
+nn=1
+#----------------------------------------------------------------
+SOPT='n:m:p:v:N:j:t:l:x:h'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 np nt
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			SLPART=${SLPART:1}$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-x)
+			exe=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input ]] && echo "invalid input " && exit
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $nt ]]  && nt=1
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+#================================================
+bname="${input%.*}"
+input="${bname}.input"
+geom="${bname}.car"
+if ! [ -e "$input" ]; then
+  echo "$input: file not found"
+  exit 1
+fi
+if ! [ -e "$geom" ]; then
+  echo "Erro: There is no Geometry file:"
+  echo "$geom: file not found"
+  exit 1
+fi
+dos2unix -q $input $geom
+#================================================
+natom=`cat $geom | awk '{print NF}' | grep 9 | wc -l`
+maxcpu=$((4*natom))
+if [ $np -gt $maxcpu ]; then
+   echo "Maximum allowed number of cores for your input is:" $maxcpu
+   exit 0
+fi
+#================================================
+# Check for memory
+m1=`grep -i Max_memory $input | awk '{print $2}'`
+if [ -z $m1 ]; then
+   [ -z $mem ] && { echo "Error: Memory required not defined" ; exit ; } || true
+   memF=$((mem*1024/np))
+   echo "Max_memory                    $memF" >> $input
+else
+   [ -z $mem ] && mem=$(((np*m1+600)/1024))
+fi
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+#-----------------------------------
+if [ -z $Disk ]; then
+        Disk=2
+elif [ $nn -eq 1 ]; then
+        CMD1="cd /tmp"
+        CMD2="cp -a * \$SLURM_SUBMIT_DIR"
+fi
+#-----------------------------------
+[[ -z $jobname ]] && jobname=$bname
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=1
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey materialsstudio
+
+module load MaterialsStudio/$Ver
+
+cp $input $geom /tmp
+cd /tmp
+RunDMol3.sh -np \$SLURM_NTASKS $bname
+rsync -a . \$SLURM_SUBMIT_DIR/Output_\$SLURM_JOBID
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

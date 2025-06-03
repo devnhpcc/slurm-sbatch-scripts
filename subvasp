@@ -1,0 +1,153 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+	[ -z $n2 ] && n2=$n1 && n1=1
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for VASP"
+	echo ""
+	echo "Usage: ${sname} [OPTION]"
+	echo "   
+	-n  <np>          Number of processors.
+	-m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version. Available: 5.4.1, 5.4.4, 6.1.0, 6.4.3 
+	-x  <exe> 	  Name of exe file. (gam, ncl or std) Default: std
+	-j  <jobname>     Default: VASP
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:  ${sname} -n 16 -m 10 -t 4-0 -p amd128"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLPART="##SBATCH --partition="
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+Ver="5.4.4"
+Disk=2
+exe=vasp_std
+mpost="intel"
+#----------------------------------------------------------------
+SOPT='n:m:p:v:x:j:t:l:h'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 nn ntpn
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			SLPART=${SLPART:1}$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-x)
+			exe=$2 ; exe="vasp_${exe#*_}"
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+#----------------------------------------------------------------
+np=$((nn*ntpn))
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+ext=0
+for file in INCAR  KPOINTS  POSCAR  POTCAR; do
+    [ ! -e $file ] && echo "$file: File not found" && ext=1
+done
+[ $ext -eq 1 ] && exit
+dos2unix -q INCAR  KPOINTS  POSCAR  POTCAR
+#-----------------------------------
+[[ -z $jobname ]] && jobname=VASP
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=1
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey vasp
+
+ml purge
+module load VASP/${Ver}-${mpost}
+#export SRUN_CPUS_PER_TASK=\$SLURM_CPUS_PER_TASK
+#export OMP_STACKSIZE=512m
+
+srun $exe
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

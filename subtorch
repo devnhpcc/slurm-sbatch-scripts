@@ -1,0 +1,198 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for PyTorch"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n  <nt:nc>       Number of Tasks:Number of cpus per task.
+	-m  <mem>         Memory required for job (GB). Default: 4
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version.
+                          1:  PyTorch/1.12.1-foss-2022a-CUDA-11.7.0
+			  2:  PyTorch/1.13.1-Ma23.1-Py3.7.3
+                          3:  PyTorch/1.13.1-Py3.7.4
+			  4:  PyTorch/2.1-An23.03-CUDA-11.7.0
+			  5:  PyTorch/2.1.2-foss-2022b
+			  6:  PyTorch/2.2.0-Py3.10.8
+			  7:  PyTorch/2.3.0-Py3.10.8
+			  8:  unsloth/torch240-cu121
+			  9:  unsloth/torch260-vllm
+
+        -g  <gpu> 	  Number of GPU Device.         Default: 1
+	-o  <opt>         Options for input python file.
+	-T                Use the "torchrun" command instead of "python".
+	-u                Unbuffered print messages.
+	-j  <jobname>     a name for the job allocation Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-po <popt>        Options for python or torchrun command.
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:   $sname run.py -n 2 -m 4 -v 4 -t 2-0 -o '-c config/gran_DD.yaml'"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+PART="gpu"
+SLTIME="##SBATCH --time="
+submit=1
+NG=1
+Disk=2
+EXE="python"
+#----------------------------------------------------------------
+SOPT='n:m:p:v:g:j:o:t:l:hTu'
+LOPT='no,so:,po:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 nt nc
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			PART=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-g)
+			NG=$2
+			shift		;;
+		-o)
+			post_opt=$2
+			shift		;;
+		-T)
+			EXE=torchrun	;;
+                -u)
+                        _U="-u"         ;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--po)
+			exe_opt=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $Ver ]] && echo "Please specify the software version by -v option" && exit
+[[ -z $mem ]] && mem=2
+[[ -z $nt ]]  && nt=1
+[[ -z $nc ]]  && { nc=$nt; nt=1; }
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+case $Ver in
+	1)
+		module="PyTorch/1.12.1-foss-2022a-CUDA-11.7.0" ;;
+	2)
+		module="PyTorch/1.13.1-Ma23.1-Py3.7.3"    ;;
+	3)
+		module="PyTorch/1.13.1-Py3.7.4"           ;;
+	4)
+		module="PyTorch/2.1-An23.03-CUDA-11.7.0"  ;;
+	5)
+		module="PyTorch/2.1.2-foss-2022b"  
+		NG=0
+		PART="gpu,amd128"                         ;;
+	6)
+		module="PyTorch/2.2.0-Py3.10.8"           ;;
+	7)
+		module="PyTorch/2.3.0-Py3.10.8"           ;;
+	8)
+		module="unsloth/torch240-cu121"           ;;
+	9)
+		module="unsloth/torch260-vllm"           ;;
+	*)
+		echo "Invalid version."
+	        echo "use: '$sname -h' for more information" ; exit ;;
+esac
+#================================================
+dos2unix -q $input
+bname="${input%.*}"
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[[ -z $jobname ]] && jobname=${bname}
+ext="${input##*.}"
+if [ "$ext" == "py" ]; then
+	CMD="$EXE $_U $exe_opt $input $post_opt"
+else
+	chmod +x $input
+	CMD="./$input $post_opt"
+fi
+#-----------------------------------
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N 1
+
+## number of cores
+#SBATCH -n $nt
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nc
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$PART
+
+#SBATCH --gres=tmp:${Disk},gpu:$NG
+#SBATCH --wckey pytorch
+
+ml purge
+module load $module
+$CMD
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

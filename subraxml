@@ -1,0 +1,192 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for RAxML and RAxML-NG"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n  <np[:nT]>     Number of MPI and OpenMP processors.
+	-N  <nn[:nn]>     Number of nodes and number of tasks per node. 
+	-m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version.
+                             RAxML   : 8.2.12i, 8.2.12g, 8.2.12m Default: 8.2.12i
+			     RAxML-NG: 1.2.1, 1.2.0, 1.0.2, 1.1.0 Default: 1.2.1
+	-o  <opt>         Options for raxmlHPC or raxml-ng commands. 
+	-j  <jobname>     Default: RAxML
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-ng               Run RAxML-NG
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:   ${sname} input.fas -n 8 -m 2 -o '-f a -x 423774 -p 423774 -N 1000 -m GTRGAMMAI -O' -t 1-0"
+	echo " Example:   ${sname} testDNA.fa -n 8 -m 2 -o '--model GTR+G' -ng -t 1-0"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+Part=amd128
+nn=1
+NG=0
+#----------------------------------------------------------------
+SOPT='n:m:p:v:N:j:o:t:l:h'
+LOPT='no,ng,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 np nt
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			Part=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-o)
+			exeopt=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--ng)
+			NG=1 ; _NG=-NG 	;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+[[ $NG -eq 1 && -z $Ver ]] && Ver="1.2.1"
+[[ $NG -eq 0 && -z $Ver ]] && Ver="8.2.12i"
+case $Ver in
+	8.2.12i)
+		module="RAxML/8.2.12-intel-2023a-hybrid-avx2" ;;
+	8.2.12g)
+		module="RAxML/8.2.12-gompi-2022a-hybrid-avx2" ;;
+	8.2.12m)
+		module="RAxML/8.2.12-intel-2023a-mpi-avx2"
+		[[ -z $nt ]] && nt=1			      ;;
+	1.2.1)
+		module="RAxML-NG/1.2.1-iimpi-2023a"           ;;
+	1.2.0i)
+		module="RAxML-NG/1.2.0-iimpi-2023a"           ;;
+	1.2.0g)
+		module="RAxML-NG/1.2.0-gompi-2022a"           ;;
+	1.0.2)
+		module="RAxML-NG/1.0.2-gompi-2022a"           ;;
+	1.1.0)
+		module="RAxML-NG/1.1.0-GCC-11"
+	        [[ -z $nt ]] &&	nt=$np  ; np=1                ;;
+	*)
+		echo "Invalid version."
+esac
+#================================================
+if ! [ -e "$input" ]; then
+  echo '-----------Error------------'
+  echo "$input: file not found" >&2
+  echo '----------------------------'
+  exit 1
+fi
+dos2unix -q $input
+#-----------------------------------
+bname="${input%.*}"
+jobfile=${bname}.job
+[[ -z $jobname ]] && jobname=RAxML$_NG
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[[ -z $nt && $NG -eq 0 ]] && nt=2
+[[ -z $nt && $NG -eq 1 ]] && nt=1
+[[ $nt -gt 1 ]] && Topt="-T $nt"
+
+[[ $NG -eq 0 ]] && CMD="raxmlHPC $Topt $exeopt -n ${bname}.tre -s $input"
+[[ $NG -eq 1 ]] && CMD="raxml-ng --msa $input $exeopt --threads $nt"
+cat << END > $jobfile
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nt
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$Part
+
+#SBATCH --wckey raxml
+
+module load $module
+export SRUN_CPUS_PER_TASK=\$SLURM_CPUS_PER_TASK
+
+srun $CMD
+
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobfile}

@@ -1,0 +1,190 @@
+#!/bin/bash
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+        echo "Create and submit job for StarCCM+"
+        echo ""
+        echo "Usage: ${sname} <INPUT> [OPTION]"
+        echo "
+        -n  <np>          Number of cores.
+        -N  <nn[:nt]>     Number of nodes and number of tasks per node.
+        -m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version. Available: 2402, 2310. Default: 2310
+        -j  <jobname>     Name of job file. Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Default: 5
+        -t  <time>        Run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-M  <macro>       Java Macro file. 
+	-A  <account>     The name of your Account.
+	-g  <NGPU>        Number of GPUs. 
+	-r8               Use Double Precisiob Version.
+	-co <opt>         Additional options for starccm+ batch command.
+        -so <sopt>        Additional slurm options if needed.
+        -no               Only write job file.
+        -h | --help       Print this message and exit."
+        echo ""
+        echo " Example:   ${sname} input.smi -n 32 -m 40 -r8 -t 1-0 "
+        echo ""
+        exit
+}
+[[ $# -eq 0 ]] && Usage
+#=================================================
+Ver=2310
+Disk=2
+part="amd128"
+nn=1
+JF=0
+NG=0
+MLDP=""
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLACCT="##SBATCH --account="
+SLNN="##SBATCH -N "
+#------------------------------------------------
+SOPT='n:m:p:v:N:s:j:A:t:l:M:g:h'
+LOPT='no,so:,co:,r8,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+        case "$1" in
+                -n)
+                        _split $2 np nt
+                        shift           ;;
+                -m)
+                        mem=$2
+                        shift           ;;
+                -p)
+                        part=$2
+                        shift           ;;
+                -t)
+                        SLTIME=${SLTIME:1}$2
+                        shift           ;;
+                -v)
+                        Ver=$2
+                        shift           ;;
+                -N)
+                        _split $2 nn ntpn
+                        shift           ;;
+                -E)
+                        Email="$2"
+                        shift           ;;
+                -A)
+                        SLACCT=${SLACCT:1}$2
+                        shift           ;;
+                -g)
+                        NG=$2
+                        shift           ;;
+                -j)
+                        jobname=$2
+                        shift           ;;
+                -l)
+                        Disk=$2
+                        shift           ;;
+                -M)
+                        Macro=$2
+                        shift           ;;
+                --r8)
+                        MLDP="-R8"      ;;
+                --co)
+                        cmd_opt=$2
+                        shift           ;;
+                --so)
+                        slurm_opt=$2
+                        shift           ;;
+                --no)
+                        JF=1            ;;
+                -h|--help)
+                        Usage ; exit    ;;
+                --)
+                        shift ; break   ;;
+                *)
+                        echo "$1: Wrong optiona!" >&2
+                        exit 1          ;;
+        esac
+        shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+        [[ -z $input ]] &&  input=$arg && continue
+        echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+shift $((OPTIND - 1))
+#------------------------------------------------
+name=${input%%.*}
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ -z $nt ]]  && nt=1
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+
+if [ "$mem" == "0" ]; then
+  SLMEM="#SBATCH --exclusive"
+else
+  SLMEM="#SBATCH --mem=${mem}G"
+fi
+#=================================================
+cmd_opt+=" -np $np "
+[ $NG -gt 0 ] && cmd_opt+="-gpgpu auto:$NG "
+#=================================================
+[ -z $jobname ] && jobname=${name~} || true
+jobfile=${name^}.job
+#=================================================
+write_job() {
+   exec 3>&1 # Save current stdout
+   exec > $jobfile
+   echo "#!/bin/bash"
+   echo "#SBATCH -J $jobname"
+   echo "#SBATCH -o %x_%j.out"
+   echo ""
+   echo "## memory required per node."
+   echo "$SLMEM"
+   echo ""
+   echo "## number of nodes"
+   echo "#SBATCH -N $nn"
+   echo ""
+   echo "## number of cores"
+   echo "#SBATCH -n $np"
+   echo ""
+   echo "## number of tasks per node (MPI task)"
+   echo "$SLNTPN"
+   echo ""
+   echo "## number of cpus per task (OpenMP Threads)"
+   echo "#SBATCH -c $nt"
+   echo ""
+   echo "## total run time of the job"
+   echo "$SLTIME"
+   echo ""
+   echo "## name of account for the job"
+   echo "$SLACCT"
+   echo ""
+   echo "## name of queue or partition"
+   echo "#SBATCH -p $part"
+   echo ""
+   echo "#SBATCH --gres=tmp:${Disk},gpu:$NG"
+   echo "#SBATCH --wckey=starccm"
+   echo ""
+   echo module purge
+   echo ml StarCCM+/${Ver}${MLDP}
+   echo ""
+   echo "$CMD1"
+   echo "$CMDR"
+   echo starccm+ -batch $cmd_opt $input 
+   echo rm -f $jobfile
+   exec 1>&3  # Restore stdout
+   [ $JF -eq 1 ] && exit
+}
+#=================================================
+write_job
+sbatch $slurm_opt $jobfile
+

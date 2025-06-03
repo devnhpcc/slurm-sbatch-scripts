@@ -1,0 +1,159 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+        echo "Create and submit job for exciting FP-LAPW Code"
+        echo ""
+        echo "Usage: ${sname} [OPTION]"
+        echo "   
+        -n  <n1[:n2]>     Number of MPI and OpenMP processors.
+        -N  <n3[:n4]>     Number of nodes and number of tasks per node. 
+        -m  <mem>         Memory required for job (GB).
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+        -j  <jobname>     Default: Exciting
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -so <sopt>        Additional slurm options if needed.
+        -no               Only write job file.
+         -h | --help      Print this message and exit."
+        echo ""
+        echo " Example:  ${sname} -n 16 -m 4 -t 4:30:00 "
+        echo ""
+        exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLPART="##SBATCH --partition="
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+nn=1
+EXE="srun exciting_mpi"
+jobname=Exciting
+#----------------------------------------------------------------
+SOPT='n:m:p:N:j:t:v:l:h'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+        case "$1" in
+                -n)
+                        _split $2 np nt
+                        shift           ;;
+                -m)
+                        mem=$2
+                        shift           ;;
+                -p)
+                        SLPART=${SLPART:1}$2
+                        shift           ;;
+                -t)
+                        SLTIME=${SLTIME:1}$2
+                        shift           ;;
+                -v)
+                        Ver=$2
+                        shift           ;;
+                -N)
+                        _split $2 nn ntpn
+                        shift           ;;
+                -j)
+                        jobname=$2
+                        shift           ;;
+                -l)
+                        Disk=$2
+                        shift           ;;
+                --so)
+                        slurm_opt=$2
+                        shift           ;;
+                --no)
+                        submit=0        ;;
+                -h|--help)
+                        Usage ; exit    ;;
+                --)
+                        shift ; break   ;;
+                *)
+                        echo "$1: Wrong optiona!" >&2
+                        exit 1          ;;
+        esac
+        shift
+done
+#echo 'Remaining arguments:'
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ -z $nt ]]  && nt=1
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+
+[[ $mem -gt 92 ]] && SLPART="#SBATCH --partition=amd128"
+#================================================
+if [ -e input.xml ]; then
+        dos2unix -q input.xml
+else
+        echo "input.xml File not found!!"
+        exit
+fi
+#-----------------------------------
+if [ -z $Disk ]; then
+        Disk=2
+elif [ $nn -eq 1 ]; then
+        CMD1="cp input.xml /tmp  ; cd /tmp"
+        CMD2="mv * \$SLURM_SUBMIT_DIR"
+fi
+#-----------------------------------
+if [ $nt -gt 1 ]; then
+       EXE=exciting_smp
+       nn=1 ; np=1
+fi
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nt
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey exciting
+
+module load exciting
+$CMD1
+$EXE
+$CMD2
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job
+                                                                              
+

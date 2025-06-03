@@ -1,0 +1,144 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for AIMAll"
+	echo ""
+	echo "Usage: ${sname} <input> [OPTION] [Program Options without the dash]"
+	echo "   
+	-n  <nproc>       Number of processors. Default: 1
+	-m  <mem>         Memory required for job (GB). Default: 2GB
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -x  <exe> 	  Name of exec file. Default: aimqb
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:  ${sname} B38.FChk -t 4-0 source=1 encomp=4"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLTIME="##SBATCH --time="
+Part=amd128
+submit=1
+nn=1
+np=1
+mem=2
+exe=aimqb.exe
+#----------------------------------------------------------------
+SOPT='n:m:p:v:x:f:o:t:l:h'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			np=$2
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			Part=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-x)
+			exe=$2
+			shift		;;
+		-o)
+			exeopt=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+        [[ -z $input ]] &&  input=$arg && continue
+	exeopt+="-$arg "
+#        echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+if ! [ -e "$input" ]; then
+  echo '-----------Error------------'
+  echo "$input: file not found" >&2
+  echo '----------------------------'
+  exit 1
+fi
+dos2unix -q $input
+#-----------------------------------
+if [ -z $Disk ]; then
+        Disk=2
+elif [ $nn -eq 1 ]; then
+        CMD1="cd /tmp"
+        CMD2="cp -a * \$SLURM_SUBMIT_DIR"
+fi
+#-----------------------------------
+[[ "$exe" == "${exe%.*}" ]] && exe=${exe}.exe
+bname="${input%.*}"
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[[ -z $jobname ]] && jobname=$bname
+[[ $np -gt 1 ]] && exeopt+=" -nproc=$np"
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+
+#Real memory required per node
+$slcmd1
+
+## number of nodes
+#SBATCH -N 1
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$np
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$Part
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey aimall
+
+module load AIMAll
+$exe -nogui $exeopt \$SLURM_SUBMIT_DIR/$input
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

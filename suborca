@@ -1,0 +1,190 @@
+#!/bin/bash
+sname=`basename $0`
+submit=1
+GOPTS=""
+nn=1
+mem=0
+Disk=10
+SLPART="##SBATCH --partition="
+SLTIME="##SBATCH --time="
+SLACCT="##SBATCH --account="
+Ver=6.0.1
+#======================================================================
+#======================================================================
+function Usage(){
+        echo "Create and submit job for ORCA"
+        echo ""
+        echo "Usage: ${sname} <INPUT> [OPTION]"
+        echo "
+        -n  <np>          Number of processors.
+        -m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+	-d  <disk>        Disk space required for scratch (GB).
+	-v  <ver>         ORCA Version. Default: 6.0.1
+	-j  <name>        Slurm Job Name. Default: name of INPUT.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-A  <account>     Account name.
+        -so <sopt>        Additional slurm options if needed.
+        -no               Only write job file.
+        -h | --help       Print this message and exit."
+        echo ""
+        echo " Example:  $sname water.inp -n 16 -m 10 -p amd128 -t 2-0"
+        echo ""
+	exit
+}
+#======================================================================
+[[ $# -eq 0 ]] && Usage
+SOPT='n:m:N:p:v:d:j:ht:A:'
+LOPT='no,so:,fo:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			np=$2
+			shift		;;
+		-N)
+			nn=$2
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			SLPART=${SLPART:1}$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-A)
+			SLACCT=${SLACCT:1}$2
+			shift		;;
+		-d)
+			Disk=$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-j)
+			JNAME=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h | --help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong option!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+#======================================================================
+#======================================================================
+function write_jobfile(){
+
+cat << END > $jobfile
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+#
+## number of nodes
+#SBATCH -N 1
+ 
+## memory per node
+#SBATCH --mem=${mem}G
+
+## number of tasks
+#SBATCH -n $np
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=1
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## account name
+$SLACCT 
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey=orca
+
+module purge 
+module load orca/$Ver
+
+cp $input /tmp
+cd /tmp
+
+sync_output.sh -t 1h -ad -p $iname -e *.tmp* -D Out_\${SLURM_JOBID}
+
+\$ORCA_ROOT/orca $input > ${iname}.out
+
+sync_output.sh -t 0 -a -d -p $iname -e *.tmp* -D Out_\${SLURM_JOBID}
+rm -f $jobfile
+END
+}
+#======================================================================
+#======================================================================
+check_input() {
+    local file="$1"       # ORCA input file
+    local current_np
+
+    if [[ ! -f "$file" ]]; then
+        echo "Error: File '$file' not found!"
+        exit
+    fi
+    dos2unix -q $file
+
+    # Extract current processor count
+    local current_np=$(grep -oP "(?<=!PAL)\d+" "$file")
+    
+    if [[ -z "$current_np" ]]; then
+        current_np=$(grep -oP "(?<=nprocs )\d+" "$file")
+    fi
+    
+    # Default to 1 if np is not set
+    if [[ -z "$current_np" ]]; then
+        current_np=1
+    fi
+
+    # If np is specified, modify the input file
+    if [[ -n "$np" ]]; then
+	[ ! -e .${file}.org ] && cp $file .${file}.org
+        # Remove existing processor settings
+        sed -i '/!PAL/d' "$file"
+        sed -i '/%pal/,/end/d' "$file"
+
+	sed -i '2{/^[[:space:]]*$/d;}' $file
+        # Add the new processor setting
+	sed -i '1a \ ' "$file"  # Insert blank line after first line
+	sed -i '2a %pal\nnprocs '"$np"'\nend' "$file"
+	sed -i '7{/^[[:space:]]*$/d;}' $file
+
+        echo "Updated '$file' to use $np processors."
+    else
+        # Return the current processor count
+        np=$current_np
+    fi
+}
+#======================================================================
+check_input $input
+iname=${input%.*}
+[[ -z $JNAME ]] && jobname=${iname~} || jobname=$JNAME
+jobfile="$jobname.job"
+[ $mem -eq 0 ] && mem=$(( np*3/2 > 8 ? np*3/2 : 8 ))
+write_jobfile $file
+[[ $submit -eq 1 ]] && sbatch $slurm_opt $jobfile || true
+#======================================================================

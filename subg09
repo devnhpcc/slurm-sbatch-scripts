@@ -1,0 +1,282 @@
+#!/bin/bash
+sname=`basename $0`
+submit=1
+GOPTS=""
+nn=1
+Disk=10
+SLPART="##SBATCH --partition="
+SLTIME="##SBATCH --time="
+SLACCT="##SBATCH --account="
+Ver=g09D1
+#======================================================================
+function check_input(){
+   local input=($@) var ID=0
+   [ ${#input[@]} -gt 1 ] && Files=($@) && return
+
+   Files=()
+   for f in `cluset -e $input`; do
+      if [ -e $f ]; then
+         Files+=($f)
+      fi
+   done
+   if [ "${input^^}" == "ALLCOM" ]; then
+      Files=$(ls *.com | head -1)
+      CMD="for file in \`ls *.com\`; do g09 GOPTS \$file ; done"
+      ID=1
+   elif [ "${input^^}" == "ALLGJF" ]; then
+      Files=$(ls *.gjf | head -1)
+      CMD="for file in \`ls *.gjf\`; do g09 GOPTS \$file ; done"
+      ID=2
+   fi
+   if [ $ID -ne 0 ]; then
+      var=${PWD##*/}
+      JNAME=${var//[[:blank:]]/}
+   fi
+
+   if [ ${#Files[@]} -eq 0 ]; then
+      echo "$input file not found"
+      exit 1
+   fi
+}
+#======================================================================
+function Usage(){
+        echo "Create and submit job for Gaussian-09"
+        echo ""
+        echo "Usage: ${sname} <INPUT> [OPTION]"
+        echo "
+        -n  <np>          Number of processors.
+        -m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+	-d  <disk>        Disk space required for scratch (GB).
+	-v  <ver>         G09 Version. Default: g09D1
+	-j  <name>        Slurm Job Name. Default: name of INPUT.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-A  <account>     Account name.
+	-f                convert .chk files to .fchk
+	-fo <fopt>        formchk options
+        -so <sopt>        Additional slurm options if needed.
+        -no               Only write job file.
+        -h | --help       Print this message and exit."
+        echo ""
+        echo " Example:  $sname test.com -n 16 -m 10 -p xeon24 -t 2-0 -d 100"
+        echo ""
+	exit
+}
+#======================================================================
+[[ $# -eq 0 ]] && Usage
+SOPT='n:m:N:p:v:d:j:hfl:t:A:'
+LOPT='no,so:,fo:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			np=$2  ;  _NP=$2
+			shift		;;
+		-N)
+			nn=$2
+			shift		;;
+		-m)
+			mem=$2 ;  _MEM=$2
+			shift		;;
+		-p)
+			SLPART=${SLPART:1}$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-A)
+			SLACCT=${SLACCT:1}$2
+			shift		;;
+		-d)
+			Disk=$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-l)
+			llinda=$2
+			shift		;;
+		-j)
+			JNAME=$2
+			shift		;;
+		-f)
+			FCHK=1 		;;
+		--fo)
+			form_opt=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h | --help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong option!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+#======================================================================
+function mem_proc() {
+local input=$1
+#-----------------------------------
+cp $input .$input.org
+if [ -z $_NP ]; then
+   # get number of processors from gaussian input file
+   # works with "%nproc=" and "%nprocs="
+   np=$(grep -i -m 1 %nproc $input | awk -F= '{print $2}')
+
+   # set default number of processors to 1
+   if [ "$np" == "" ]; then
+     np=1
+     echo '     **************************************'
+     echo '     You dont specify number of processors.'
+     echo '     Your job will run with one processor.'
+     echo '     **************************************'
+   fi
+else
+   np=$_NP
+   sed -i '/^%nproc/Id ' $input
+   GOPTS="-p=$np"
+fi
+#-----------------------------------
+if [ -z $_MEM ]; then
+   # get memory from gaussian input file
+   memIn=$(grep -i -m 1 %mem $input | awk -F= '{print $2}')
+   if [ "$memIn" == "" ]; then
+      echo '     --------------------- Error -----------------------'
+      echo '     you should specify memory requirment. %mem or -m   '
+      echo '     ---------------------------------------------------'
+      exit
+   fi
+   memIn=${memIn^^}
+   case "${memIn}" in
+     *MB )
+	mem=${memIn%MB}
+	memMB=$mem ;;
+     *GB )
+	mem=${memIn%GB}
+	memMB=$[$mem * 1024] ;;
+     *MW )
+	mem=${memIn%MW}
+	memMB=$[$mem * 8] ;;
+     *GW )
+	mem=${memIn%GW}
+	memMB=$[$mem * 8192] ;;
+   esac
+   mem=$(echo $memMB | awk '{ printf "%0.f\n", (($1+1310)/1024) }')
+#   echo $mem $Mem | awk '{ print (($1-1024*$2) < 150) ? $2 : $2+1 }'
+else
+   mem=$_MEM
+   sed -i '/^%mem/Id ' $input
+   GOPTS="$GOPTS -M=${mem}GB"
+   let mem++
+fi
+#-----------------------------------
+if [ -e ${input}.1 ]; then
+   rm -f .${input}.org
+else
+   diff $input .${input}.org > /dev/null
+   [[ $? -eq 0 ]] && rm -f .${input}.org || mv .${input}.org ${input}.1
+fi
+#-----------------------------------
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#-----------------------------------
+Nt=$nn
+if [ $nn -gt 1 ]; then
+   opt="-w=\`scontrol show hostname \$SLURM_JOB_NODELIST | paste -sd, - \`"
+   GOPTS="$opt $GOPTS" 
+else
+   [ ! -z $llinda ] &&  GOPTS="-w=localhost:${llinda} $GOPTS" && Nt=$llinda
+fi
+#-----------------------------------
+CHK=(`grep %chk= $input | awk -F= '{print $2}'`)
+[[ -z $CHK ]] && unset FCHK || true
+}
+#======================================================================
+#======================================================================
+function write_jobfile(){
+   local input=$1
+
+cat << END > $jobfile
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+#
+$slcmd1
+#
+## number of nodes
+#SBATCH -N $nn
+ 
+## number of tasks
+#SBATCH -n $Nt
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$np
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## account name
+$SLACCT 
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey=gaussian
+
+module purge 
+module load gaussian/$Ver
+
+# Set MaxDisk
+export GAUSS_RDEF="MaxDisk=${Disk}GB"
+export GAUSS_LFLAGS='-v'
+
+rm -f $jobfile
+#Run Gaussian
+
+END
+
+if [ $FCHK ]; then
+cat << END >> $jobfile
+
+###### convert checkpoint files ######
+for f in ${CHK[@]}; do
+    [[ -e \$f ]] && formchk $form_opt \$f
+done
+END
+fi
+}
+#======================================================================
+check_input $input
+for file in ${Files[@]}; do
+   ext=${file##*.}
+   [[ "$ext" != "com" && "$ext" != "gjf" ]] && continue || true
+   dos2unix -q $file
+   [[ -z $JNAME ]] && jobname=${file%.*} || jobname=$JNAME
+   jobfile="$jobname.job"
+   mem_proc $file
+   write_jobfile $file
+   [[ -z $CMD ]] && GCMD="g09 GOPTS $file" || GCMD="$CMD"
+   sed -i "/^#Run/a $GCMD" $jobfile
+   sed -i "s/GOPTS/$GOPTS/" $jobfile
+
+   [[ $submit -eq 1 ]] && sbatch $slurm_opt $jobfile || true
+done
+#======================================================================

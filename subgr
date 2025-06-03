@@ -1,0 +1,217 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2 n3
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        n3=`echo $n | awk -F: '{print $3}'`
+        eval $2=$n1 ; eval $3=$n2
+	[[ ! -z $n3 ]] && eval $4=$n3
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for GROMACS"
+	echo ""
+	echo "Usage: ${sname} <default filename> [OPTION]"
+	echo "   
+	-n  <n1[:n2]>     Number of MPI and OpenMP processors.
+	-N  <n3[:n4]>     Number of nodes and number of tasks per node. 
+	-m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo -s')
+        -v  <ver>         Software version. Available: 2021.5,2023.1,2023.3 
+	-o  <opt>         Additional options for the mdrun command.
+	-g  <gpu>         Number of GPU Device.
+	-A  <acct>        The account name.
+	-j  <jobname>     Default: name of input file.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-l  <disk>        Disk space required for output files (GB)
+	-f  <cmd-file>    The name of the file that contains the desired commands.
+	-c  [cpt-file]    Continue simulation from checkpoint file
+	-d                use double precision version.
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:  ${sname} npt -n 16 -m 10 -p amd128 -o '-cpt 5 -mtx nm.mtx'"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLACCT="##SBATCH --account="
+SLNN="##SBATCH -N "
+submit=1
+Ver="2023.3"
+CPT="-cpt 120"
+DP=""
+nn=1
+Disk=5
+NG=0
+PART=amd128
+#----------------------------------------------------------------
+SOPT='n:m:p:v:N:x:j:o:g:t:l:f:A:hcd'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 np nt
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			PART=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-x)
+			exe=$2
+			shift		;;
+		-o)
+			MDOPT=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-g)
+			NG=$2
+			shift		;;
+		-A)
+			SLACCT=${SLACCT:1}$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		-f)
+			cmdfile=$2
+			shift		;;
+		-d)
+			DP="_d" 	;;
+		-c)
+			CPI="-cpi" 	;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $defn ]] &&  defn=$arg && continue
+#	echo "not defined argument --> '$arg'"
+done
+cpf=${defn}.cpt
+[[ "$arg" != "$defn" ]] && cpf=$arg
+[[ -z $CPI ]] && cpf=""
+[[ ! -z $CPI  &&  ! -e $cpf ]] && echo "$cpf: File not found!!" && exit
+[[ ! -z $CPI  &&  -e $cpf ]] && MDOPT+=" -cpi $cpf"
+[[ $MDOPT != *-cpt* ]] && MDOPT+=" -cpt 120 "
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ -z $nt ]]  && nt=1
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+case $Ver in
+	2021.5)
+		module="GROMACS/2021.5-foss-2022a-PLUMED-2.8.0" ;;
+	2023.1)
+		module="GROMACS/2023.1-foss-2022a" ;;
+	2023.1-gpu)
+		module="GROMACS/2023.1-foss-2022a-CUDA-11.8.0"  ;;
+	2023.3)
+		module="GROMACS/2023.3-foss-2022a-CUDA-11.7.0"  ;;
+	*)
+		echo "Invalid version."
+	        echo "Installed versions:  2021.5, 2023.1, 2023.1-gpu, 2023.3" ; exit ;;
+esac
+#================================================
+if [ -z $cmdfile ]; then
+	[[ -z $jobname ]] && jobname=${defn^}
+else
+	[[ ! -e $cmdfile ]] && echo "$cmdfile: File not found!!" && exit
+	dos2unix -q $cmdfile
+	[[ -z $jobname ]] && jobname=${cmdfile^}
+fi
+#-----------------------------------
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[ $NG -ne 0 ] && PART=gpu
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nt
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## Account name
+$SLACCT
+
+## name of queue or partition
+#SBATCH --partition=$PART 
+
+#SBATCH --gres=tmp:${Disk},gpu:$NG
+#SBATCH --wckey gromacs
+
+module load $module
+
+END
+
+if [ -z $cmdfile ]; then
+   cat << END >> $jobname.job
+mpirun gmx_mpi$DP mdrun -deffnm $defn $MDOPT -g \$SLURM_SUBMIT_DIR/${defn}.log
+END
+else
+   sed -e "s/gmx mdrun/mpirun gmx_mpi mdrun/g" $cmdfile > .$cmdfile
+   sed -i "s/gmx /gmx$DP /g" .$cmdfile
+   sed -i "s/gmx_mpi /gmx_mpi$DP /g" .$cmdfile
+   cat .$cmdfile >> $jobname.job
+fi
+
+echo "rm -f \$SLURM_SUBMIT_DIR/${jobname}.job " >>  $jobname.job
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

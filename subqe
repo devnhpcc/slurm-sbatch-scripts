@@ -1,0 +1,198 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for QuantumEspresso"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n  <np[:nT]>     Number of MPI and OpenMP processors.
+	-N  <nn[:nt]>     Number of nodes and number of tasks per node. 
+	-m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version. Available: 7.2, 7.1, 6.8, 6.7, 6.5, 6.3, 5.3 Default: 7.1 
+        -x  <exe> 	  Name of exec file. Default: pw.x
+	-o  <opt>         Option of exec file.
+	-j  <jobname>     Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:  subqe input.in -n 16 -m 10 -v 6.8 -x ph.x -o '-nk 1 -nd 1' -t 4-0"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLPART="##SBATCH --partition="
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+Ver="7.1"
+nn=1
+exe=pw.x
+MLPATH="ml use /share/apps/modules/all"
+#----------------------------------------------------------------
+SOPT='n:m:p:v:N:x:j:o:t:l:h'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 np nt
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			SLPART=${SLPART:1}$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-x)
+			exe=$2
+			shift		;;
+		-o)
+			exeopt=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ -z $nt ]]  && nt=1
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+case $Ver in
+	7.2)
+		module="QuantumESPRESSO/7.2-foss-2022b.lua" ;;
+	7.2i)
+		module="QuantumESPRESSO/7.2-intel-2023a" ;;
+	7.1)
+		module="QuantumESPRESSO/7.1" ;;
+	7.1i)
+		module="QuantumESPRESSO/7.1-intel-2023a.lua"  ;;
+	6.8.1)
+		module="QuantumESPRESSO/6.8.1"  ;;
+	6.8)
+		module="QuantumESPRESSO/6.8"  ;;
+	6.7)
+		module="QuantumESPRESSO/6.7"  ;;
+	6.5)
+		module="QuantumESPRESSO/6.5"  ;;
+	6.3)
+		module="QuantumESPRESSO/6.3"  ;;
+	5.3i)
+		module="QuantumESPRESSO/5.3.0-intel-2020b"  ;;
+	*)
+		echo "Invalid version."
+	        echo "Installed versions: 7.2, 7.1, 7.1i. 6.7, 6.5, 6.3, 5.3i " ; exit ;;
+esac
+#================================================
+if ! [ -e "$input" ]; then
+  echo '-----------Error------------'
+  echo "$input: file not found" >&2
+  echo '----------------------------'
+  exit 1
+fi
+dos2unix -q $input
+#-----------------------------------
+if [ -z $Disk ]; then
+        Disk=2
+elif [ $nn -eq 1 ]; then
+        CMD1="cd /tmp\nrsync -a \$SLURM_SUBMIT_DIR/ .\nrm -f \${SLURM_JOB_NAME}_\${SLURM_JOBID}.out"
+        CMD2="rsync -a . \$SLURM_SUBMIT_DIR/"
+fi
+[[ "$exe" == "gw.x"  && -z $exeopt ]] && exeopt="-npool $np"
+#-----------------------------------
+bname="${input%.*}"
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[[ -z $jobname ]] && jobname=$bname
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nt
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey QE
+
+module load $module
+$(echo -e $CMD1)
+prun $exe $exeopt -i \$SLURM_SUBMIT_DIR/$input
+$CMD2
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

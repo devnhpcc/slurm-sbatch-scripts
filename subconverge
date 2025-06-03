@@ -1,0 +1,151 @@
+#!/bin/bash
+sname=`basename $0`
+submit=1
+Disk=2
+Part=amd128
+SLTIME="##SBATCH --time="
+SLARRY="##SBATCH --array="
+Ver=2.4
+NG=0
+CUDA=""
+#======================================================================
+function Usage(){
+	echo "Create and submit job for CONVERGE CFD Software"
+        echo ""
+        echo "Usage: ${sname} [OPTION]"
+        echo "
+        -n  <np>          Number of processors.
+        -m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+	-d  <disk>        Disk space required for scratch (GB).
+	-v  <ver>         Converge Version. Default: 2.4
+	-j  <name>        Slurm Job Name. Default: name of submit directory.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+        -so <sopt>        Additional slurm options if needed.
+        -no               Only write job file.
+        -h | --help       Print this message and exit."
+        echo ""
+        echo " Example:  $sname -n 20 -m 8 -t 2-0 "
+        echo ""
+	exit
+}
+#======================================================================
+[[ $# -eq 0 ]] && Usage
+SOPT='n:m:p:a:v:d:j:ht:'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			np=$2
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			Part=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-d)
+			Disk=$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-a)
+			SLARRY=${SLARRY:1}$2
+			SA=1
+			shift 		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h | --help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong option!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $CMD ]] &&  CMD=$arg && continue
+#	echo "not defined argument --> '$arg'"
+done
+#======================================================================
+if [ -z "$jobname" ]; then
+   DirN=$(basename `pwd`)
+   jobname=$(echo $DirN | tr -d ' ',[:punct:])
+fi
+#-----------------------------------
+[[ -z "$np" ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z "$mem" ]] && echo "Error: Memory required not defined" && exit
+#-----------------------------------
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#-----------------------------------
+if [ ! -z $SA ]; then
+   ID="ID=\$SLURM_ARRAY_TASK_ID"
+   output=${input}out\$ID
+   ARGS="\"--args $arg=\$ID\""
+fi
+#-----------------------------------
+if [ $np -eq 1 ]; then
+	CMD=converge.s
+elif [ $np -gt 1 ]; then
+	CMD="srun converge"
+else
+	echo "Invalid Number of Processors!"
+	exit
+fi
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+#
+$slcmd1
+#
+## number of nodes
+#SBATCH -N 1
+ 
+## number of tasks
+#SBATCH -n $np
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$Part
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey=converge
+
+module load converge/$Ver
+
+# your commands
+$CMD
+
+rm -f $jobname.job
+END
+
+if [ $submit -eq 1 ]; then
+   if [ ! -e inputs.in ]; then
+      echo "ERROR: 'inputs.in' file not found!" ; exit
+   fi
+   sbatch $slurm_opt $jobname.job
+fi

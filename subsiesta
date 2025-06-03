@@ -1,0 +1,196 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for SIESTA"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n    <np[:nT]>   Number of MPI and OpenMP processors.
+	-N    <nn[:nt]>   Number of nodes and number of tasks per node. 
+	-m    <mem>       Memory required for job (GB).
+        -p    <part>      Partition name to submit the job. (use 'sinfo')
+        -v    <ver>       Software version. Available: 4.1.5 4.1.5i 5.0.0 5.2.0 5.2.2, Default 5.2.2
+        -x    <exe> 	  Name of exec file. Default: siesta
+	-o    <opt>       Option of exec file.
+	-j    <jobname>   Default: name of input file.
+        -l    <disk>      Disk space required for scratch (GB). Run on local hard disk.
+        -t    <time>      Run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-elec		  Run siesta as 'siesta -electrode'
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:  subsiesta input.fdf -n 16 -m 10  -t 4-0"
+	echo " Example:  subsiesta input.fdf -n 16 -m 10 -x tbtrans -v 5.2.0 -t 4-0"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLPART="##SBATCH --partition="
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+Ver="5.2.2"
+nn=1
+exe=siesta
+PART=amd128
+#----------------------------------------------------------------
+SOPT='n:m:p:v:N:x:j:o:t:l:h'
+LOPT='no,elec,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 np nt
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			PART=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-x)
+			exe=$2
+			shift		;;
+		-o)
+			exeopt="$2 "
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		--elec)
+			exeopt+="-electrode "	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ -z $nt ]]  && nt=1
+[[ $nn -gt 1 && -z $ntpn ]] && ntpn=$((np/nn + 1))
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+cmd=mpirun
+case $Ver in
+	4.1.5i)
+		module="Siesta/4.1.5-intel-2020b" ; cmd=srun ;;
+	4.1.5)
+		module="Siesta/4.1.5-foss-2021b" ;;
+	5.0.0)
+		module="Siesta/5.0.0-foss-2022b" ;;
+	5.2.0)
+		module="Siesta/5.2.0-foss-2022b" ;;
+	5.2.2)
+		module="Siesta/5.2.2-foss-2022b" ;;
+	*)
+		echo "Invalid version."
+	        echo "Installed versions: 4.1.5 4.1.5i 5.0.0 5.2.0 5.2.2, " ; exit ;;
+esac
+[ $np -eq 1 ] && cmd="" || true
+#================================================
+if ! [ -e "$input" ]; then
+  echo '-----------Error------------'
+  echo "$input: file not found" >&2
+  echo '----------------------------'
+  exit 1
+fi
+dos2unix -q $input
+#-----------------------------------
+if [ -z $Disk ]; then
+        Disk=2
+elif [ $nn -eq 1 ]; then
+        CMD1="cd /tmp\nrsync -a \$SLURM_SUBMIT_DIR/ .\nrm -f \${SLURM_JOB_NAME}_\${SLURM_JOBID}.out"
+        CMD2="rsync -a . \$SLURM_SUBMIT_DIR/"
+fi
+#-----------------------------------
+bname="${input%.*}"
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[[ -z $jobname ]] && jobname=${bname~}
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nt
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$PART
+
+#SBATCH --gres=tmp:${Disk}
+
+ml purge
+ml $module
+$cmd $exe $exeopt $input
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job
+
+#$(echo -e $CMD1)
+#prun $exe $exeopt -i \$SLURM_SUBMIT_DIR/$input
+#$CMD2

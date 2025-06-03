@@ -1,0 +1,136 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create a sample job file"
+	echo ""
+	echo "Usage: ${sname} [OPTION]"
+	echo "   
+	-n  <nt:nc>       Number of Tasks:Number of cpus per task.
+	-m  <mem>         Memory required for job (GB). Default: 4
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -g  <gpu> 	  Number of GPU Device. Default: 0
+	-j  <jobname>     a name for the job allocation Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:   $sname -n 8:2 -m 4 -t 2-0 -p amd128"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+PART="amd128"
+submit=0
+NG=0
+Disk=2
+Time="1-0"
+_U=""
+#----------------------------------------------------------------
+SOPT='n:m:p:v:g:j:o:t:l:hu'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 nt nc
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			PART=$2
+			shift		;;
+		-t)
+			Time=$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-g)
+			NG=$2
+			shift		;;
+		-o)
+			exeopt=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-u)
+			_U="-u"         ;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+[[ -z $mem ]] && mem=4
+[[ -z $nc ]]  && nc=1
+[[ -z $nt ]]  && nt=1
+[[ $NG -ge 1 ]] && PART=gpu || true
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+[ -z $jobname ] && jobname=test || true
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N 1
+
+## number of cores
+#SBATCH -n $nt
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nc
+
+## how long job takes, wallclock time d-hh:mm:ss
+#SBATCH --time=$Time
+
+## name of queue or partition
+#SBATCH --partition=$PART
+
+#SBATCH --gres=tmp:${Disk},gpu:$NG
+
+#Write your linux commands after all #SBATCH directives.
+module purge
+#load your module
+module load
+
+#run your code
+
+END
+
+echo "=== The job file \"${jobname}.job\" was created."
+echo "=== Modify it according to your needs and run the following command:"
+echo "=== sbatch ${jobname}.job"

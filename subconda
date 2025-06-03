@@ -1,0 +1,177 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for Anaconda3"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n  <nt:nc>       Number of Tasks:Number of cpus per task.
+	-m  <mem>         Memory required for job (GB). Default: 4
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version.      
+                          1) Anaconda3/2023.03-1 
+			  2) Anaconda3/2023.07-2
+			  3) Anaconda3/2023.09-0
+			  4) Anaconda3/2024.02-1
+        -g  <gpu> 	  Number of GPU Device.         Default: 0
+	-o  <opt>         Options for input file.
+	-j  <jobname>     a name for the job allocation Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-u                Unbuffered print messages.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:   $sname run.py -n 2 -m 4 -t 2-0 -o '-c config/gran_DD.yaml'"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+PART="amd128"
+SLTIME="##SBATCH --time="
+submit=1
+NG=0
+Disk=2
+Ver="2"
+_U=""
+#----------------------------------------------------------------
+SOPT='n:m:p:v:g:j:o:t:l:hu'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 nt nc
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			PART=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-g)
+			NG=$2
+			shift		;;
+		-o)
+			exeopt=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-u)
+			_U="-u"         ;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $Ver ]] && echo "Please specify the software version by -v option" && exit
+[[ -z $mem ]] && mem=2
+[[ -z $nc ]]  && nc=1
+[[ -z $nt ]]  && nt=1
+[[ $NG -ge 1 ]] && PART=gpu || true
+
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+case $Ver in
+	1)
+		module="Anaconda3/2023.03-1" ;;
+	2)
+		module="Anaconda3/2023.07-2" ;;
+	3)
+		module="Anaconda3/2023.09-0" ;;
+	4)
+		module="Anaconda3/2024.02-1" ;;
+	*)
+		module="$Ver" ;;
+	
+esac
+#================================================
+dos2unix -q $input
+bname="${input%.*}"
+#jobname=`echo "$bname" | tr '[a-z]' '[A-Z]'`
+[[ -z $jobname ]] && jobname=${bname}
+ext="${input##*.}"
+if [ "$ext" == "py" ]; then
+	CMD="python $_U $input $exeopt"
+elif [ "$ext" == "ipynb" ]; then
+	CMD="ipython $_U $input $exeopt"
+else
+	chmod +x $input
+	CMD="./$input $exeopt"
+fi
+#-----------------------------------
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N 1
+
+## number of cores
+#SBATCH -n $nt
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=$nc
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$PART
+
+#SBATCH --gres=tmp:${Disk},gpu:$NG
+#SBATCH --wckey python
+
+module purge
+module load $module
+$CMD
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job

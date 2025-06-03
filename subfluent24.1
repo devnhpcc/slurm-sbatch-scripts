@@ -1,0 +1,283 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2 n3
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        n3=`echo $n | awk -F: '{print $3}'`
+        eval $2=$n1 ; eval $3=$n2
+        [[ ! -z $n3 ]] && eval $4=$n3
+}
+#----------------------------------------------------------------
+function Usage(){
+   echo "Create and submit job for Ansys Fluent 2022.1"
+   echo ""
+   echo "Usage: ${sname} <version> [OPTIONS]"
+   echo "OPTIONS:"
+   echo "   
+   -n  <np>            Number of processors.
+   -m  <mem>           Memory required for job (GB).
+   -t  <time>          run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+   -p  <part>          Partition name to submit the job. (use 'sinfo -s')
+   -c  <case-file>     case file name    
+   -d  <data-file>     data file name, or 'si': Standard initialization. 'hi': hybrid initialization
+   -i  <NI[:NIPT:TS]>  Number of Iteration. For unsteady case: <Number_of_time_step:Iteration_per_time_step:time_step>
+   -a  <df:Mf:cf>      AutoSave parameters. data_frequency:max_files:case_frequency
+   -j  <journal>       The name of the journal file. If this option is used, the previous four options will be ignored.
+   -N  <n1[:n2]>       Number of nodes and number of tasks per node. 
+   -l  <disk>          Disk space required for output files (GB)
+   -f  <I/O format>    Output file format. 1 --> CFF , 2 --> Legacy
+   -pm <part-method>   Partitioning method in parallel mode
+   -so <sopt>          Additional slurm options if needed.
+   -no                 Only write job file.
+   -h | --help         Print this message and exit."
+   echo ""
+   echo " Example:  ${sname} 2ddp -n 12 -m 8 -t 2-0 -c Q25.cas.h5 -i 1000:20 -a 100:5"
+   echo ""
+   exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+SLPART="##SBATCH --partition="
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+nn=1
+Disk=5
+casf=3
+GZ=""
+VerA=(2d 2d_host 2d_node 2ddp 2ddp_host 2ddp_node)
+VerA+=(3d 3d_host 3d_node 3ddp 3ddp_node 3ddp_host)
+#----------------------------------------------------------------
+SOPT='n:m:p:c:N:d:j:a:t:l:i:f:h'
+LOPT='no,ib,so:,pm:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			np=$2
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			SLPART=${SLPART:1}$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-c)
+			casfile=$2
+			shift		;;
+		-d)
+			datafile=$2
+			shift		;;
+		-f)
+			IOF=$2
+			case $IOF in
+				1) IOF="CFF" ;;
+				2) IOF="Legacy" ;;
+				*) echo "Invalid i/o format. use 1 or 2" ; exit ;;
+			esac
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-i)
+			_split $2 nts ips tsz
+			shift		;;
+		-a)
+			_split $2 datf maxf casf
+			case $casf in
+				1) casf="each-time" ;;
+				2) casf="if-case-is-modified" ;;
+				3) casf="if-mesh-is-modified" ;;
+				*) echo "invalid case frequency number" ; exit ;;
+			esac
+			shift		;;
+		-j)
+			input=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--ib)
+			intcon="-pib"   ;;
+		--pm)
+			partcmd="p/p/a/u no /parallel/partition/auto/method/$2"
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#----------------------------------------------------------------
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $Ver ]] &&  Ver=$arg && continue
+#	echo "not defined argument --> '$arg'"
+done
+#----------------------------------------------------------------
+[[ " ${VerA[*]} " =~ " ${Ver} " ]] || { echo "$Ver: is not a valide version!!" ; exit 1; }
+#----------------------------------------------------------------
+if [ -z $casfile ] && [ -z $input ]; then
+   echo "Neither case file nor journal file is specified."
+   echo "use: ${scname} -help for more information" ; exit
+elif [ -z $casfile ]; then
+   [[ ! -e $input ]] && echo "$input: File not found." && exit
+   jobname=FL${input%%.*}
+elif [ -z $input ]; then
+   [[ ! -e $casfile ]] && echo "$casfile: File not found." && exit
+   Rcom="file/rc $casfile"
+   if [ -z $datafile ]; then
+      datafile=$(echo $casfile | sed 's/.cas/.dat/')
+      [[ -e $datafile ]] && Rcom="file/rcd $casfile"
+
+   elif [ "${datafile^^}" == "SI" ]; then
+      initcmd="solve/initialize/initialize-flow"
+
+   elif [ "${datafile^^}" == "HI" ]; then
+      initcmd="solve/initialize/hyb-initialization"
+
+   else      
+      [[ ! -e $datafile ]] && echo "$datafile: File not found." && exit
+      initcmd="file/rd $datafile"
+   fi
+   rname=${casfile%%.cas*}
+   jobname=FL${rname}
+   input=${jobname}.jou
+else
+   echo "The '-c' and '-j' options should not be used at the same time."
+   exit
+fi
+if [ -z $IOF ]; then
+   ext=${casfile##*.cas}
+   IOF="Legacy"
+   [[ "$ext" == ".h5" ]] && IOF="CFF"
+fi
+[[ "$IOF" == "Legacy" ]] && GZ=".gz"
+
+jobfile=$jobname.job
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ ! -z $ntpn ]] && SLNTPN=${SLNTPN:1}$ntpn
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+nreport=5
+[[ $ips -le 20 ]] && nreport=2
+#================================================
+#====================================
+writejob() {
+cat <<END > $jobfile
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+
+## the real memory required per node.
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+ 
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+$SLPART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey=fluent
+
+ml fluent/24.1
+
+END
+if [[ $nn -eq 1 ]]; then
+        echo "fluent $Ver -gu -t$np -affinity=core -i $input" >> $jobfile
+else
+        cat <<END >> $jobfile
+HOST_FILE=slurm.\${SLURM_JOB_ID}.hosts
+scontrol show hostnames "\$SLURM_JOB_NODELIST" > \$HOST_FILE
+fluent $Ver -gu $intcon -t$np -cnf=\${HOST_FILE} -mpi=openmpi -affinity=core -i $input
+rm  \${HOST_FILE}
+END
+fi
+}
+#====================================
+#====================================
+if [ -z $casfile ]; then
+   writejob
+   [[ $submit -eq 1 ]] && sbatch $slurm_opt $jobfile
+   exit
+fi
+#====================================
+cat <<END > $input
+$partcmd
+pref/gen/def "$IOF"
+file/set-batch-options no yes no
+$Rcom
+$initcmd
+END
+#====================================
+if [ ! -z $datf ]; then
+cat <<END >> $input
+file/auto-save
+case-frequency $casf
+data-frequency $datf
+retain-most-recent-files yes
+max-files $maxf
+root-name "${rname}${GZ}"
+quit
+END
+fi
+#====================================
+cat <<END >> $input
+solve/monitors/residual/print yes
+solve/monitors/residual/plot no
+solve/set reporting $nreport
+END
+#====================================
+if [ -z $ips ]; then
+   itercmd="solve/iterate $nts"
+else
+   itercmd="solve/dual-time-iterate $nts $ips"
+fi
+if [ ! -z $tsz ]; then
+	itercmd="solve/set/transient-controls/time-step-size $tsz \n$itercmd"
+fi
+cat <<END >> $input
+$(echo -e $itercmd)
+file/write-case-data ${rname}${GZ}
+exit
+END
+sed -i '/^$/d' $input
+#====================================
+writejob
+echo "rm -f \$SLURM_SUBMIT_DIR/${jobname}.job " >>  $jobfile
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobfile}

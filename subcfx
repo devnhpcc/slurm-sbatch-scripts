@@ -1,0 +1,216 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function _split(){
+        local n=$1 n1 n2
+        n1=`echo $n | awk -F: '{print $1}'`
+        n2=`echo $n | awk -F: '{print $2}'`
+        eval $2=$n1 ; eval $3=$n2
+}
+#----------------------------------------------------------------
+function Usage(){
+	echo "Create and submit job for cfx5solve"
+	echo ""
+	echo "Usage: ${sname} <INPUT> [OPTION]"
+	echo "   
+	-n  <np>          Number of processors.
+	-N  <nn>          Number of nodes. 
+	-m  <mem>         The real memory required per node (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+        -v  <ver>         Software version. Available: 22.1
+	-c  <file>        Use initial values and continue the run history from the specified File
+	-o  <opt>         Option of cfx5solve command.
+	-j  <jobname>     Default: name of input file.
+        -l  <disk>        Disk space required for scratch (GB). Run on local hard disk.
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-so <sopt>        Additional slurm options if needed.
+	-no               Only write job file.
+	-h | --help       Print this message and exit."
+	echo ""
+	echo " Example:  ${sname} input.def -n 16 -m 10 -t 4-0 -l 30"
+	echo ""
+	exit
+}
+[[ $# -eq 0 ]] && Usage
+#----------------------------------------------------------------
+PART=amd128
+SLNTPN="##SBATCH --ntasks-per-node="
+SLTIME="##SBATCH --time="
+SLNN="##SBATCH -N "
+submit=1
+Ver="22.1"
+nn=1
+_opt="-numa auto"
+_opt=""
+#----------------------------------------------------------------
+SOPT='n:m:p:v:N:j:o:c:t:l:h'
+LOPT='no,so:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			_split $2 np nt
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			PART=$2
+			shift		;;
+		-c)
+			rfile=$2
+			_opt+=" -cont-from-file $2"
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		-N)
+			_split $2 nn ntpn
+			shift		;;
+		-o)
+			options=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-l)
+			Disk=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h|--help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong optiona!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+[[ -z $input  ||  ! -e $input ]] && echo "invalid input file name" && exit
+#----------------------------------------------------------------
+[[ -z $np ]]  && echo "Error: Number of processors not defined" && exit
+[[ -z $mem ]] && echo "Error: Memory required not defined" && exit
+[[ -z $nt ]]  && nt=1
+#================================================
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#================================================
+parallel="-par-local -part \$SLURM_NPROCS"
+if [ $nn -gt 1 ]; then
+       ntpn=$((np/nn))
+       [ $((np%nn)) -ne 0 ] && let ntpn++
+       SLNTPN=${SLNTPN:1}$ntpn
+       STARTM="'Open MPI Distributed Parallel'"
+       parallel="-par -par-dist \$hosts -start-method $STARTM"
+fi
+# for start-method see $CFX5ROTT/etc/start-methods.ccl
+#================================================
+if [ ! -z $rfile ]; then
+  if [ ! -e $rfile ]; then
+  echo '-----------Error------------'
+  echo "$rfile: file not found" >&2
+  echo '----------------------------'
+  exit 1
+  fi
+fi
+
+if ! [ -e "$input" ]; then
+  echo '-----------Error------------'
+  echo "$input: file not found" >&2
+  echo '----------------------------'
+  exit 1
+fi
+bname="${input%.*}"
+[ -z $jobname ] && jobname=$bname
+fext=`echo $input | awk -F"." '{ print $NF }'`
+case $jobname in
+  [0-9]* ) jname=CFX$jname
+esac
+
+if [ $fext = "def" ]; then
+   define="-def $input"
+
+elif [ $fext = "mdef" ]; then
+   define="-mdef $input"
+
+else
+   echo "extension of define file should be .def or .mdef"
+   exit 1
+fi
+#================================================
+#================================================
+#dos2unix -q $input
+#-----------------------------------
+if [ -z $Disk ]; then
+        Disk=2
+elif [ $nn -eq 1 ]; then
+        CMD1="cp $input $rfile /tmp\ncd /tmp\nsync_output.sh -a"
+        CMD2="sync_output.sh -t 0 -av"
+fi
+#-----------------------------------
+
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+$slcmd1
+
+## number of nodes
+#SBATCH -N $nn
+
+## number of cores
+#SBATCH -n $np
+
+## number of tasks per node (MPI task)
+$SLNTPN
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=1
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## name of queue or partition
+#SBATCH --partition=$PART
+
+#SBATCH --gres=tmp:${Disk}
+#SBATCH --wckey CFX
+
+module load cfx/$Ver
+END
+if [ $nn -gt 1 ]; then
+cat << END >> $jobname.job
+hosts=\$(srun hostname | sort | uniq -c | awk '{print \$2 "*" \$1}' | paste -sd, -)
+END
+fi
+cat << END >> $jobname.job
+$(echo -e $CMD1)
+cfx5solve -batch $define $_opt $parallel $options
+$CMD2
+rm -f \$SLURM_SUBMIT_DIR/${jobname}.job
+END
+[[ $submit -eq 1 ]] && sbatch  $slurm_opt ${jobname}.job
+
+#hosts=`scontrol show hostnames $SLURM_JOB_NODELIST`
+#hosts=`echo $hosts | sed -e 's/ /,/g'`
+#echo $hosts
+

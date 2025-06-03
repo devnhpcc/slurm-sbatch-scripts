@@ -1,0 +1,143 @@
+#!/bin/bash
+sname=`basename $0`
+submit=1
+GOPTS=""
+Part="amd128"
+nn=1
+SLTIME="##SBATCH --time="
+SLACCT="##SBATCH --account="
+Ver=2019b
+CVer=6.1
+#======================================================================
+function Usage(){
+        echo "Create and submit job for LiveLink Matlab & Comsol"
+        echo ""
+        echo "Usage: ${sname} <INPUT> [OPTION]"
+        echo "
+        -n  <n1>          Number of processors.
+        -m  <mem>         Memory required for job (GB).
+        -p  <part>        Partition name to submit the job. (use 'sinfo')
+	-v  <ver>         Matlab Version. Available: 2019b, 2021b, 2022b, 2023a Default: 2019b
+        -t  <time>        run time of the job. Valid format: M, H:M:S, D-H, D-H:M
+	-j  <jobname>     Job Name. Default: name of input file
+	-A  <Account>     Account name.
+	-cv <ver>         Comsol Version. Available: 6.2, 6.1, 5.4  Default: 6.1
+        -so <sopt>        Additional slurm options if needed.
+        -no               Only write job file.
+        -h | --help       Print this message and exit."
+        echo ""
+        echo " Example:  $sname main.m -n 8 -m 10 -v 2022b -t 2-0"
+        echo ""
+	exit
+}
+#======================================================================
+[[ $# -eq 0 ]] && Usage
+SOPT='n:m:p:j:v:ht:A:'
+LOPT='no,so:,cv:,help'
+OPTS=$(getopt -a -o ${SOPT} -l ${LOPT} -n ${sname} -- "$@")
+[ $? -ne 0 ] && echo 'Terminating...' >&2 && exit 1
+eval set -- "$OPTS"
+unset OPTS
+while true; do
+	case "$1" in
+		-n)
+			np=$2
+			shift		;;
+		-m)
+			mem=$2
+			shift		;;
+		-p)
+			Part=$2
+			shift		;;
+		-j)
+			jobname=$2
+			shift		;;
+		-t)
+			SLTIME=${SLTIME:1}$2
+			shift		;;
+		-A)
+			SLACCT=${SLACCT:1}$2
+			shift		;;
+		-v)
+			Ver=$2
+			shift		;;
+		--cv)
+			CVer=$2
+			shift		;;
+		--so)
+			slurm_opt=$2
+			shift		;;
+		--no)
+			submit=0	;;
+		-h | --help)
+			Usage ; exit	;;
+		--)
+			shift ; break	;;
+		*)
+			echo "$1: Wrong option!" >&2
+			exit 1		;;
+	esac
+	shift
+done
+#echo 'Remaining arguments:'
+for arg; do
+	[[ -z $input ]] &&  input=$arg && continue
+	echo "not defined argument --> '$arg'"
+done
+#======================================================================
+if ! [ -e "$input" ]; then
+  echo '-----------Error------------'
+  echo "$input: file not found" >&2
+  echo '----------------------------'
+  exit 1
+fi
+#-----------------------------------
+[ -z $jobname ] && jobname=${input%.*} || true
+dos2unix -q $input 
+#-----------------------------------
+if [ "$mem" == "0" ]; then
+  slcmd1="#SBATCH --exclusive"
+else
+  slcmd1="#SBATCH --mem=${mem}G"
+fi
+#-----------------------------------
+cat << END > $jobname.job
+#!/bin/bash
+#SBATCH -J $jobname
+#SBATCH -o %x_%j.out
+#
+$slcmd1
+#
+## number of nodes
+#SBATCH -N 1
+ 
+## number of tasks
+#SBATCH -n $np
+
+## number of cpus per task (OpenMP Threads)
+#SBATCH --cpus-per-task=1
+
+## how long job takes, wallclock time d-hh:mm:ss
+$SLTIME
+
+## The account name
+$SLACCT
+
+## name of queue or partition
+#SBATCH --partition=$Part
+
+module purge
+ml comsol/$CVer
+ml matlab/$Ver
+
+# run comsol mphserver and create matlab startup file
+LiveLink_Mat.sh
+
+# Run Matlab
+matlab -nodisplay -nodesktop -nosplash -r "MPH\${SLURM_JOBID}; ${input%.*}; exit"
+rm -f $jobname.job
+rm -f MPH\${SLURM_JOBID}.m
+END
+
+[[ $submit -eq 1 ]] && sbatch $slurm_opt $jobname.job
+
